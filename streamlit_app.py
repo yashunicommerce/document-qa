@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -39,7 +39,7 @@ def call_order_json_test(
     shopify_order: Any,
     customisation_expression: Any,
     customisation_console: bool,
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     payload = {
         "tenantCode": tenant_code,
         "channelCode": channel_code,
@@ -64,7 +64,7 @@ def call_order_json_test(
     return body, None
 
 
-def render_results(body: dict[str, Any]) -> None:
+def render_results(body: Dict[str, Any]) -> None:
     status = body.get("status", "unknown")
     if status == "success":
         st.success("All expressions evaluated successfully.")
@@ -151,7 +151,7 @@ def render_reference_tab() -> None:
 
 
 def render_test_tab(
-    channels: list[dict[str, Any]],
+    channels: List[Dict[str, Any]],
     api_url: str,
 ) -> None:
     tenant_codes = sorted({channel["tenantCode"] for channel in channels if channel.get("tenantCode")})

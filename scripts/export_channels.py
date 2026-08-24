@@ -57,7 +57,7 @@ def split_blocks(text: str) -> list[str]:
     return blocks
 
 
-def parse_block(block: str) -> dict | None:
+def parse_block(block: str) -> Optional[dict]:
     tenant_match = re.search(r"\"tenantCode\"\s*:\s*\"([^\"]+)\"", block)
     channel_match = re.search(r"\"channelCode\"\s*:\s*\"([^\"]+)\"", block)
     if not tenant_match or not channel_match:
