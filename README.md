@@ -6,6 +6,7 @@ Streamlit UI for the TA team to dry-run Shopify channel customisations via `POST
 
 ## Features
 
+- **Build customisation** tab — paste order JSON, pick custom fields or order-create console, tick suggested mappings, generate JSON, and test
 - Tenant + channel dropdown from **MongoDB live** or **local snapshot** (`data/channels_index.json`)
 - Auto-loads `customFieldsCustomization` or `orderCreateCustomization` for the selected channel
 - Paste Shopify order JSON and run expression evaluation via `order-json-test`

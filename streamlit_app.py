@@ -14,6 +14,7 @@ from data_loader import (
     resolve_channels,
     search_patterns,
 )
+from order_hints import analyze_order, build_customisation, format_customisation_json
 
 DEFAULT_API_URL = (
     "https://shopifyproxy.unicommerce.com/shopify/orders/order-json-test"
@@ -148,6 +149,141 @@ def render_reference_tab() -> None:
 
     if len(filtered) > 50:
         st.info(f"Showing first 50 of {len(filtered)} matches. Narrow your search to see more.")
+
+
+def render_builder_tab(
+    channels: List[Dict[str, Any]],
+    api_url: str,
+) -> None:
+    st.subheader("Customisation Constructor")
+    st.caption(
+        "Paste order JSON first, choose custom fields or order-create console, "
+        "then tick the mappings you need. Suggestions are based on what's in your order."
+    )
+
+    if "builder_order_json" not in st.session_state:
+        st.session_state.builder_order_json = ""
+
+    order_col, action_col = st.columns([5, 1])
+    with action_col:
+        if st.button("Load sample", key="builder_load_sample"):
+            st.session_state.builder_order_json = json.dumps(SAMPLE_ORDER, indent=2)
+            st.rerun()
+
+    with order_col:
+        order_text = st.text_area(
+            "1. Shopify order JSON",
+            value=st.session_state.builder_order_json,
+            height=260,
+            placeholder='Paste order JSON here, e.g. {"id": 123, "tags": "PREPAID", ...}',
+            key="builder_order_json",
+        )
+
+    if not order_text.strip():
+        st.info("Paste order JSON to continue.")
+        return
+
+    try:
+        shopify_order = json.loads(order_text)
+    except json.JSONDecodeError as exc:
+        st.error(f"Invalid order JSON: {exc}")
+        return
+
+    if not isinstance(shopify_order, dict):
+        st.error("Order JSON must be a JSON object.")
+        return
+
+    st.success("Order JSON parsed.")
+
+    customisation_mode = st.radio(
+        "2. What do you want to create?",
+        options=[
+            ("Custom fields (`customFieldsCustomization`)", False),
+            ("Order create console (`orderCreateCustomization`)", True),
+        ],
+        format_func=lambda option: option[0],
+        horizontal=True,
+        key="builder_mode",
+    )
+    customisation_console = customisation_mode[1]
+    hints = analyze_order(shopify_order, customisation_console)
+
+    present_hints = [hint for hint in hints if hint.get("present")]
+    missing_hints = [hint for hint in hints if not hint.get("present")]
+
+    st.markdown("### 3. Pick fields to map")
+    st.caption("Tick only what you need — suggestions show sample value from your order and the expression to use.")
+
+    selected_hints: List[Dict[str, Any]] = []
+    field_names: Dict[str, str] = {}
+
+    left_col, right_col = st.columns(2)
+    columns = [left_col, right_col]
+    for index, hint in enumerate(present_hints):
+        col = columns[index % 2]
+        with col:
+            apply_key = f"builder_apply_{hint['id']}"
+            field_key = f"builder_field_{hint['id']}"
+            enabled = st.checkbox(
+                f"Apply **{hint['label']}**",
+                key=apply_key,
+                help=hint["message"],
+            )
+            st.caption(hint["message"])
+            st.markdown(f"Sample value: `{hint.get('sampleValue')}`")
+            st.code(hint["expression"], language=None)
+            field_name = st.text_input(
+                "Uniware field name",
+                value=hint["fieldSuggestion"],
+                key=field_key,
+                disabled=not enabled,
+            )
+            if enabled:
+                selected_hints.append(hint)
+                field_names[hint["id"]] = field_name.strip() or hint["fieldSuggestion"]
+
+    if missing_hints:
+        with st.expander(f"Not found in this order ({len(missing_hints)} optional mappings)"):
+            for hint in missing_hints:
+                st.markdown(f"**{hint['label']}** — {hint['message']}")
+                st.code(hint["expression"], language=None)
+
+    if not selected_hints:
+        st.warning("Tick at least one mapping above to build customisation JSON.")
+        return
+
+    built = build_customisation(selected_hints, field_names, customisation_console)
+    st.markdown("### 4. Generated customisation")
+    st.code(format_customisation_json(built), language="json")
+
+    st.markdown("### 5. Test (optional)")
+    tenant_codes = sorted({channel["tenantCode"] for channel in channels if channel.get("tenantCode")})
+    tcol, ccol = st.columns(2)
+    with tcol:
+        tenant_code = st.selectbox("Tenant", tenant_codes, key="builder_tenant")
+    tenant_channels = [channel for channel in channels if channel.get("tenantCode") == tenant_code]
+    channel_options = {channel_label(channel): channel for channel in tenant_channels}
+    with ccol:
+        selected_label = st.selectbox("Channel", list(channel_options.keys()), key="builder_channel")
+        selected_channel = channel_options[selected_label]
+
+    if st.button("Run test with generated customisation", type="primary", key="builder_run_test"):
+        with st.spinner("Calling order-json-test…"):
+            body, error = call_order_json_test(
+                api_url=api_url,
+                tenant_code=selected_channel["tenantCode"],
+                channel_code=selected_channel["channelCode"],
+                shopify_order=shopify_order,
+                customisation_expression=built,
+                customisation_console=customisation_console,
+            )
+        st.subheader("Results")
+        if error and body is None:
+            st.error(error)
+        elif body is not None:
+            if error:
+                st.warning(error)
+            render_results(body)
 
 
 def render_test_tab(
@@ -308,7 +444,12 @@ if not channels:
     st.error("No channels available. Configure Mongo or ship `data/channels_index.json`.")
     st.stop()
 
-test_tab, reference_tab = st.tabs(["Run test", "Expression reference"])
+builder_tab, test_tab, reference_tab = st.tabs(
+    ["Build customisation", "Run test (existing channel)", "Expression reference"]
+)
+
+with builder_tab:
+    render_builder_tab(channels, api_url)
 
 with test_tab:
     render_test_tab(channels, api_url)
