@@ -3,8 +3,15 @@ from typing import Any
 
 import requests
 import streamlit as st
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+
+from data_loader import (
+    channel_label,
+    get_secret,
+    load_local_patterns,
+    parse_customisation,
+    resolve_channels,
+    search_patterns,
+)
 
 DEFAULT_API_URL = (
     "https://shopifyproxy.unicommerce.com/shopify/orders/order-json-test"
@@ -21,69 +28,6 @@ SAMPLE_ORDER = {
         {"sku": "CREAM-01", "price": "439.00", "quantity": 1, "title": "Sample Product"}
     ],
 }
-
-
-def get_secret(key: str, default: str = "") -> str:
-    try:
-        return st.secrets.get(key, default)
-    except (FileNotFoundError, KeyError, AttributeError):
-        return default
-
-
-@st.cache_resource(show_spinner=False)
-def get_mongo_client(uri: str) -> MongoClient:
-    return MongoClient(uri, serverSelectionTimeoutMS=8000)
-
-
-@st.cache_data(ttl=300, show_spinner="Loading channels from MongoDB…")
-def load_channels(mongo_uri: str, db_name: str) -> list[dict[str, Any]]:
-    client = get_mongo_client(mongo_uri)
-    query = {
-        "enabled": True,
-        "$or": [
-            {
-                "configurations.customFieldsCustomization": {
-                    "$exists": True,
-                    "$nin": [None, ""],
-                }
-            },
-            {
-                "configurations.orderCreateCustomization": {
-                    "$exists": True,
-                    "$nin": [None, ""],
-                }
-            },
-        ],
-    }
-    projection = {
-        "_id": 0,
-        "tenantCode": 1,
-        "channelCode": 1,
-        "shopName": 1,
-        "configurations.customFieldsCustomization": 1,
-        "configurations.orderCreateCustomization": 1,
-    }
-    return list(
-        client[db_name]["channel"]
-        .find(query, projection)
-        .sort([("tenantCode", 1), ("channelCode", 1)])
-    )
-
-
-def parse_customisation(raw: Any) -> Any:
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (list, dict)):
-        return raw
-    if isinstance(raw, str):
-        return json.loads(raw.strip())
-    raise ValueError(f"Unsupported customisation type: {type(raw).__name__}")
-
-
-def channel_label(channel: dict[str, Any]) -> str:
-    shop = channel.get("shopName") or ""
-    suffix = f" ({shop})" if shop else ""
-    return f"{channel['tenantCode']} / {channel['channelCode']}{suffix}"
 
 
 def call_order_json_test(
@@ -151,6 +95,162 @@ def render_results(body: dict[str, Any]) -> None:
         st.json(body)
 
 
+def render_reference_tab() -> None:
+    patterns, meta = load_local_patterns()
+    if not patterns:
+        st.warning("No expression patterns found. Run `python scripts/export_channels.py`.")
+        return
+
+    st.caption(
+        f"Reference library from production customisations — "
+        f"{meta.get('patternCount', len(patterns))} unique expressions, "
+        f"{len(meta.get('categories', []))} categories."
+    )
+
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        category = st.selectbox(
+            "Category",
+            ["All"] + sorted(meta.get("categories", [])),
+            key="ref_category",
+        )
+    with filter_col2:
+        ctype = st.selectbox(
+            "Customisation type",
+            ["All", "Custom fields", "Order create"],
+            key="ref_type",
+        )
+    with filter_col3:
+        query = st.text_input("Search field or expression", key="ref_query")
+
+    filtered = search_patterns(patterns, query=query, category=category, customisation_type=ctype)
+    st.metric("Matching patterns", len(filtered))
+
+    for pattern in filtered[:50]:
+        title = ", ".join(pattern.get("fieldNames", [])[:3]) or "Expression"
+        with st.expander(f"{title} · {pattern.get('category')} · used {pattern.get('usageCount')}x"):
+            st.code(pattern.get("expression", ""), language=None)
+            example_rows = [
+                {
+                    "Tenant": example.get("tenantCode"),
+                    "Channel": example.get("channelCode"),
+                    "Shop": example.get("shopName"),
+                    "Field": example.get("fieldName"),
+                    "Type": example.get("type"),
+                }
+                for example in pattern.get("examples", [])
+            ]
+            if example_rows:
+                st.caption("Example channels using this expression")
+                st.dataframe(example_rows, use_container_width=True, hide_index=True)
+
+    if len(filtered) > 50:
+        st.info(f"Showing first 50 of {len(filtered)} matches. Narrow your search to see more.")
+
+
+def render_test_tab(
+    channels: list[dict[str, Any]],
+    api_url: str,
+) -> None:
+    tenant_codes = sorted({channel["tenantCode"] for channel in channels if channel.get("tenantCode")})
+    col1, col2 = st.columns(2)
+
+    with col1:
+        tenant_code = st.selectbox("Tenant", tenant_codes, key="test_tenant")
+
+    tenant_channels = [channel for channel in channels if channel.get("tenantCode") == tenant_code]
+    channel_options = {channel_label(channel): channel for channel in tenant_channels}
+
+    with col2:
+        selected_label = st.selectbox("Channel", list(channel_options.keys()), key="test_channel")
+        selected_channel = channel_options[selected_label]
+
+    configs = selected_channel.get("configurations") or {}
+    has_custom_fields = bool(configs.get("customFieldsCustomization"))
+    has_order_create = bool(configs.get("orderCreateCustomization"))
+
+    if not has_custom_fields and not has_order_create:
+        st.warning("Selected channel has no customisation configuration.")
+        return
+
+    default_index = 1 if has_order_create and not has_custom_fields else 0
+    customisation_type = st.radio(
+        "Customisation type",
+        options=[
+            ("Custom fields (`customFieldsCustomization`)", False),
+            ("Order create (`orderCreateCustomization`)", True),
+        ],
+        format_func=lambda option: option[0],
+        horizontal=True,
+        index=default_index,
+        key="test_customisation_type",
+    )
+
+    customisation_console = customisation_type[1]
+    raw_customisation = (
+        configs.get("orderCreateCustomization")
+        if customisation_console
+        else configs.get("customFieldsCustomization")
+    )
+
+    st.subheader("Loaded customisation")
+    try:
+        parsed_customisation = parse_customisation(raw_customisation)
+        st.json(parsed_customisation)
+    except (json.JSONDecodeError, ValueError) as exc:
+        st.error(f"Could not parse channel customisation JSON: {exc}")
+        st.code(str(raw_customisation))
+        return
+
+    st.subheader("Shopify order JSON")
+    if "order_json" not in st.session_state:
+        st.session_state.order_json = ""
+
+    order_col, action_col = st.columns([5, 1])
+    with action_col:
+        if st.button("Load sample"):
+            st.session_state.order_json = json.dumps(SAMPLE_ORDER, indent=2)
+            st.rerun()
+
+    with order_col:
+        order_text = st.text_area(
+            "Order JSON",
+            value=st.session_state.order_json,
+            height=320,
+            placeholder='Paste raw Shopify order JSON, e.g. {"id": 123, "tags": "..."}',
+            key="order_json",
+        )
+
+    if st.button("Run test", type="primary"):
+        if not order_text.strip():
+            st.error("Paste Shopify order JSON before running the test.")
+            return
+
+        try:
+            shopify_order = json.loads(order_text)
+        except json.JSONDecodeError as exc:
+            st.error(f"Invalid order JSON: {exc}")
+            return
+
+        with st.spinner("Calling order-json-test…"):
+            body, error = call_order_json_test(
+                api_url=api_url,
+                tenant_code=selected_channel["tenantCode"],
+                channel_code=selected_channel["channelCode"],
+                shopify_order=shopify_order,
+                customisation_expression=parsed_customisation,
+                customisation_console=customisation_console,
+            )
+
+        st.subheader("Results")
+        if error and body is None:
+            st.error(error)
+        elif body is not None:
+            if error:
+                st.warning(error)
+            render_results(body)
+
+
 st.set_page_config(
     page_title="Shopify Customisation Tester",
     page_icon="🛒",
@@ -159,140 +259,57 @@ st.set_page_config(
 
 st.title("Shopify Order Customisation Tester")
 st.caption(
-    "Dry-run `customFieldsCustomization` and `orderCreateCustomization` expressions "
-    "against sample Shopify order JSON via `order-json-test`. No OpenAI key required."
+    "Dry-run channel customisations against sample Shopify order JSON via `order-json-test`. "
+    "No OpenAI key required."
 )
+
+mongo_uri = get_secret("MONGO_URI")
+mongo_db = get_secret("MONGO_DB", "shopify") or "shopify"
+api_url = get_secret("ORDER_JSON_TEST_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+prefer_local = get_secret("USE_LOCAL_INDEX", "false").lower() in {"1", "true", "yes"}
 
 with st.sidebar:
     st.header("Configuration")
-    mongo_uri = get_secret("MONGO_URI")
-    mongo_db = get_secret("MONGO_DB", "shopify") or "shopify"
-    api_url = get_secret("ORDER_JSON_TEST_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    st.text_input("API URL", value=api_url, disabled=True)
 
-    if not mongo_uri:
-        st.error("Set `MONGO_URI` in `.streamlit/secrets.toml` or Streamlit Cloud secrets.")
-        st.stop()
-
-    st.text_input("API URL", value=api_url, disabled=True, help="Override via ORDER_JSON_TEST_URL secret.")
-    st.caption(f"Mongo DB: `{mongo_db}`")
+    source_options = ["Local snapshot", "MongoDB live"]
+    default_source = "Local snapshot" if prefer_local or not mongo_uri else "MongoDB live"
+    data_source = st.radio("Channel source", source_options, index=source_options.index(default_source))
 
     try:
-        get_mongo_client(mongo_uri).admin.command("ping")
-        st.success("MongoDB connected")
-    except PyMongoError as exc:
-        st.error(f"MongoDB unreachable: {exc}")
+        channels, source_label, source_meta = resolve_channels(data_source, mongo_uri, mongo_db)
+    except Exception as exc:
+        st.error(f"Could not load channels: {exc}")
         st.stop()
 
-try:
-    channels = load_channels(mongo_uri, mongo_db)
-except PyMongoError as exc:
-    st.error(f"Failed to load channels: {exc}")
-    st.stop()
+    st.success(f"Using {source_label}")
+    if source_meta.get("mongoError"):
+        st.warning(f"Mongo fallback: {source_meta['mongoError']}")
+    st.metric("Channels loaded", len(channels))
+
+    patterns, pattern_meta = load_local_patterns()
+    if patterns:
+        st.metric("Reference expressions", pattern_meta.get("patternCount", len(patterns)))
+
+    with st.expander("Source info"):
+        st.markdown(
+            "- `data/channels_index.json` — 490 production channels (Aug 2026)\n"
+            "- `data/expression_patterns.json` — 312 unique SpEL expressions\n"
+            "- See `data/source_info.md` for categories"
+        )
+        if source_meta.get("source"):
+            st.caption(source_meta["source"])
+        if source_meta.get("extractedAt"):
+            st.caption(f"Snapshot date: {source_meta['extractedAt']}")
 
 if not channels:
-    st.warning("No enabled channels with customisation config found in MongoDB.")
+    st.error("No channels available. Configure Mongo or ship `data/channels_index.json`.")
     st.stop()
 
-st.sidebar.metric("Channels with customisation", len(channels))
+test_tab, reference_tab = st.tabs(["Run test", "Expression reference"])
 
-tenant_codes = sorted({c["tenantCode"] for c in channels if c.get("tenantCode")})
-col1, col2 = st.columns(2)
+with test_tab:
+    render_test_tab(channels, api_url)
 
-with col1:
-    tenant_code = st.selectbox("Tenant", tenant_codes)
-
-tenant_channels = [c for c in channels if c.get("tenantCode") == tenant_code]
-channel_options = {channel_label(c): c for c in tenant_channels}
-
-with col2:
-    selected_label = st.selectbox("Channel", list(channel_options.keys()))
-    selected_channel = channel_options[selected_label]
-
-configs = selected_channel.get("configurations") or {}
-has_custom_fields = bool(configs.get("customFieldsCustomization"))
-has_order_create = bool(configs.get("orderCreateCustomization"))
-
-if not has_custom_fields and not has_order_create:
-    st.warning("Selected channel has no customisation configuration.")
-    st.stop()
-
-default_index = 0
-if has_order_create and not has_custom_fields:
-    default_index = 1
-
-customisation_type = st.radio(
-    "Customisation type",
-    options=[
-        ("Custom fields (`customFieldsCustomization`)", False),
-        ("Order create (`orderCreateCustomization`)", True),
-    ],
-    format_func=lambda x: x[0],
-    horizontal=True,
-    index=default_index,
-)
-
-customisation_console = customisation_type[1]
-raw_customisation = (
-    configs.get("orderCreateCustomization")
-    if customisation_console
-    else configs.get("customFieldsCustomization")
-)
-
-st.subheader("Loaded customisation")
-try:
-    parsed_customisation = parse_customisation(raw_customisation)
-    st.json(parsed_customisation)
-except (json.JSONDecodeError, ValueError) as exc:
-    st.error(f"Could not parse channel customisation JSON: {exc}")
-    st.code(str(raw_customisation))
-    st.stop()
-
-st.subheader("Shopify order JSON")
-if "order_json" not in st.session_state:
-    st.session_state.order_json = ""
-
-order_col, action_col = st.columns([5, 1])
-with action_col:
-    if st.button("Load sample"):
-        st.session_state.order_json = json.dumps(SAMPLE_ORDER, indent=2)
-        st.rerun()
-
-with order_col:
-    order_text = st.text_area(
-        "Order JSON",
-        value=st.session_state.order_json,
-        height=320,
-        placeholder='Paste raw Shopify order JSON, e.g. {"id": 123, "tags": "..."}',
-        key="order_json",
-    )
-
-run_test = st.button("Run test", type="primary")
-
-if run_test:
-    if not order_text.strip():
-        st.error("Paste Shopify order JSON before running the test.")
-    else:
-        try:
-            shopify_order = json.loads(order_text)
-        except json.JSONDecodeError as exc:
-            st.error(f"Invalid order JSON: {exc}")
-            shopify_order = None
-
-        if shopify_order is not None:
-            with st.spinner("Calling order-json-test…"):
-                body, error = call_order_json_test(
-                    api_url=api_url,
-                    tenant_code=selected_channel["tenantCode"],
-                    channel_code=selected_channel["channelCode"],
-                    shopify_order=shopify_order,
-                    customisation_expression=parsed_customisation,
-                    customisation_console=customisation_console,
-                )
-
-            st.subheader("Results")
-            if error and body is None:
-                st.error(error)
-            elif body is not None:
-                if error:
-                    st.warning(error)
-                render_results(body)
+with reference_tab:
+    render_reference_tab()

@@ -6,9 +6,10 @@ Streamlit UI for the TA team to dry-run Shopify channel customisations via `POST
 
 ## Features
 
-- Tenant + channel dropdown populated from MongoDB (`shopify.channel`)
+- Tenant + channel dropdown from **MongoDB live** or **local snapshot** (`data/channels_index.json`)
 - Auto-loads `customFieldsCustomization` or `orderCreateCustomization` for the selected channel
-- Paste Shopify order JSON and run expression evaluation
+- Paste Shopify order JSON and run expression evaluation via `order-json-test`
+- **Expression reference** tab — 312 production SpEL patterns with example channels
 - Shows per-field status, value (including empty string), and errors
 
 ## Setup
@@ -27,9 +28,26 @@ Streamlit UI for the TA team to dry-run Shopify channel customisations via `POST
 
    | Secret | Description |
    |---|---|
-   | `MONGO_URI` | Mongo connection string (prod/staging shopify DB) |
+   | `MONGO_URI` | Mongo connection string (optional if using local snapshot) |
    | `MONGO_DB` | Database name (default: `shopify`) |
    | `ORDER_JSON_TEST_URL` | API base URL (default: production proxy) |
+   | `USE_LOCAL_INDEX` | Set `true` to default to bundled snapshot instead of Mongo |
+
+## Bundled source data
+
+Production customisations are stored under `data/`:
+
+| File | Contents |
+|---|---|
+| `channels_index.json` | 490 channels with parsed customisations |
+| `expression_patterns.json` | 312 unique expressions grouped by category |
+| `source_info.md` | Category guide and refresh instructions |
+
+Refresh from a new Mongo dump:
+
+```bash
+python scripts/export_channels.py /path/to/mongo_dump.txt
+```
 
 3. Run the app:
 
