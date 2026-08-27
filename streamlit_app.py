@@ -17,6 +17,7 @@ from data_loader import (
     search_patterns,
 )
 from expression_generator import (
+    ArrayFilterSegment,
     ORDER_CUSTOMIZATION_KEYS,
     TYPE_OVERRIDE_OPTIONS,
     allowed_order_create_fields,
@@ -139,6 +140,33 @@ def _values_match(local_value: Any, server_value: Any) -> bool:
         return float(local_value) == float(server_value)
     except (TypeError, ValueError):
         return str(local_value) == str(server_value)
+
+
+def _scalar_child_fields(value: Any) -> List[str]:
+    if not isinstance(value, dict):
+        return []
+    return [
+        str(key)
+        for key, child in value.items()
+        if not isinstance(child, (dict, list))
+    ]
+
+
+def _matching_array_item(items: Any, field: str, operator: str, comparison: str) -> Any:
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict) or item.get(field) is None:
+            continue
+        candidate = str(item[field])
+        matched = (
+            candidate.lower() == comparison.lower()
+            if operator == "equals ignore case"
+            else candidate == comparison
+        )
+        if matched:
+            return item
+    return None
 
 
 def render_reference_tab() -> None:
@@ -265,6 +293,101 @@ def render_requirement_tab(
         # Action refresh immediately when the source or semantic type changes.
         source_label = st.selectbox("Shopify value to use", option_labels)
         source = option_map[source_label]
+        source_path = source["path"]
+        source_value = source["value"]
+        resolved_source_label = source_label
+        if isinstance(source_value, list):
+            array_selection = st.radio(
+                "Array item to use",
+                ["First item (get(0))", "Find first matching item"],
+                horizontal=True,
+                key="simple_array_selection",
+            )
+            if array_selection == "First item (get(0))":
+                first_item = source_value[0] if source_value else None
+                child_fields = _scalar_child_fields(first_item)
+                if isinstance(first_item, dict) and child_fields:
+                    child_field = st.selectbox(
+                        "Field from get(0)",
+                        child_fields,
+                        key="simple_array_first_field",
+                    )
+                    source_path = source["path"] + [0, child_field]
+                    source_value = first_item.get(child_field)
+                    resolved_source_label = f"{source_label} → get(0).{child_field}"
+                elif first_item is not None:
+                    source_path = source["path"] + [0]
+                    source_value = first_item
+                    resolved_source_label = f"{source_label} → get(0)"
+                else:
+                    st.warning("This array is empty, so it has no get(0) value.")
+            else:
+                object_items = [item for item in source_value if isinstance(item, dict)]
+                match_fields = sorted(
+                    {
+                        field
+                        for item in object_items
+                        for field in _scalar_child_fields(item)
+                    }
+                )
+                if not object_items or not match_fields:
+                    st.warning("Filtering requires an array of JSON objects with scalar fields.")
+                else:
+                    fcol1, fcol2 = st.columns(2)
+                    with fcol1:
+                        match_field = st.selectbox(
+                            "Find item where field",
+                            match_fields,
+                            key="simple_array_match_field",
+                        )
+                    with fcol2:
+                        match_operator = st.selectbox(
+                            "Match using",
+                            ["equals ignore case", "equals"],
+                            key="simple_array_match_operator",
+                        )
+                    match_value = st.text_input(
+                        "Match value",
+                        placeholder="For example: Gift_Message",
+                        key="simple_array_match_value",
+                    )
+                    return_fields = sorted(
+                        {
+                            field
+                            for item in object_items
+                            for field in _scalar_child_fields(item)
+                        }
+                    )
+                    return_field = st.selectbox(
+                        "Return field from matching item",
+                        return_fields,
+                        key="simple_array_return_field",
+                    )
+                    match_segment = ArrayFilterSegment(
+                        field=match_field,
+                        comparison=match_value,
+                        operator=match_operator,
+                    )
+                    source_path = source["path"] + [match_segment, return_field]
+                    matching_item = _matching_array_item(
+                        source_value, match_field, match_operator, match_value
+                    )
+                    source_value = (
+                        matching_item.get(return_field) if matching_item is not None else None
+                    )
+                    resolved_source_label = (
+                        f"{source_label} → first item where {match_field} "
+                        f"{match_operator} '{match_value}' → {return_field}"
+                    )
+
+        source = {
+            "path": source_path,
+            "value": source_value,
+            "label": resolved_source_label,
+        }
+        if resolved_source_label not in condition_option_map:
+            condition_option_map[resolved_source_label] = source
+            condition_option_labels = list(condition_option_map.keys())
         inferred_type = suggested_selected_type(source["value"])
         selected_type = st.selectbox(
             "Treat selected value as",
@@ -322,7 +445,12 @@ def render_requirement_tab(
             else:
                 secondary_source_label = st.selectbox(
                     "Decimal field to add/subtract",
-                    option_labels,
+                    [
+                        label
+                        for label, option in option_map.items()
+                        if not isinstance(option["value"], (dict, list))
+                    ]
+                    or option_labels,
                     help="The secondary field is converted with getAsDouble(); if it is missing at runtime, zero is used.",
                 )
 

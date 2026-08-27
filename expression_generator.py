@@ -6,6 +6,7 @@ Shopify channels instead of inventing arbitrary SpEL.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
 
@@ -14,6 +15,15 @@ STOP_WORDS = {
     "field", "from", "in", "into", "is", "it", "of", "on", "order", "save", "set",
     "store", "the", "this", "to", "value", "with",
 }
+
+
+@dataclass(frozen=True)
+class ArrayFilterSegment:
+    """Select the first object in an array matching a scalar field value."""
+
+    field: str
+    comparison: str
+    operator: str = "equals ignore case"
 
 TYPE_OVERRIDE_OPTIONS = ["String", "Decimal", "DateTime", "Boolean", "JSON"]
 
@@ -263,7 +273,7 @@ def json_condition_options(order: dict[str, Any]) -> List[dict[str, Any]]:
 
 
 def direct_expression_for_path(
-    path: List[Union[str, int]],
+    path: List[Union[str, int, ArrayFilterSegment]],
     selected_type: str = "String",
     default_value: str = "",
 ) -> str:
@@ -278,6 +288,8 @@ def direct_expression_for_path(
         value_expression = f"{raw_source}.getAsDouble()"
     elif normalized_type == "Boolean":
         value_expression = f"{raw_source}.getAsBoolean()"
+    elif any(isinstance(segment, ArrayFilterSegment) for segment in path):
+        value_expression = f"{raw_source}?.getAsString()"
     else:
         # String and DateTime are both represented as text in the TAM expression.
         value_expression = _json_utils_expression(path[:-1], str(path[-1]))[2:-1]
@@ -285,7 +297,7 @@ def direct_expression_for_path(
 
 
 def decimal_expression_for_path(
-    path: List[Union[str, int]],
+    path: List[Union[str, int, ArrayFilterSegment]],
     operation: str,
     amount: str = "0",
     secondary_path: Optional[List[Union[str, int]]] = None,
@@ -511,8 +523,8 @@ def _walk_keys(value: Any) -> list[str]:
 
 
 def _walk_scalar_paths(
-    value: Any, path: Optional[List[Union[str, int]]] = None
-) -> List[Tuple[List[Union[str, int]], str]]:
+    value: Any, path: Optional[List[Union[str, int, ArrayFilterSegment]]] = None
+) -> List[Tuple[List[Union[str, int, ArrayFilterSegment]], str]]:
     path = path or []
     matches: List[Tuple[List[Union[str, int]], str]] = []
     if isinstance(value, dict):
@@ -528,7 +540,9 @@ def _walk_scalar_paths(
     return matches
 
 
-def _walk_node_paths(value: Any, path: Optional[List[Union[str, int]]] = None) -> List[Tuple[List[Union[str, int]], Any]]:
+def _walk_node_paths(
+    value: Any, path: Optional[List[Union[str, int, ArrayFilterSegment]]] = None
+) -> List[Tuple[List[Union[str, int, ArrayFilterSegment]], Any]]:
     path = path or []
     nodes: List[Tuple[List[Union[str, int]], Any]] = []
     if isinstance(value, dict):
@@ -554,24 +568,59 @@ def _json_utils_expression(parent_path: List[Union[str, int]], field_name: str) 
     return f"#{{T(com.unifier.core.utils.JsonUtils).getAsString({parent}, '{field_name}')}}"
 
 
-def _path_guard_and_raw(path: List[Union[str, int]]) -> Tuple[str, str]:
+def _path_guard_and_raw(
+    path: List[Union[str, int, ArrayFilterSegment]]
+) -> Tuple[str, str]:
     current = "#saleOrderJson"
     guards = [f"{current} != null"]
+    null_safe_chain = False
     for segment in path:
-        if isinstance(segment, int):
+        if isinstance(segment, ArrayFilterSegment):
+            guards.append(f"{current} != null")
+            comparison = _spel_string(segment.comparison)
+            if segment.operator == "equals ignore case":
+                predicate = (
+                    f"get('{segment.field}')?.getAsString().equalsIgnoreCase({comparison})"
+                )
+            else:
+                predicate = f"get('{segment.field}')?.getAsString().equals({comparison})"
+            current += f".^[{predicate}]"
+            null_safe_chain = True
+        elif isinstance(segment, int):
             guards.append(f"{current} != null")
             guards.append(f"{current}.getAsJsonArray().size() > {segment}")
-            current += f".get({segment})"
+            current += f"{'?.' if null_safe_chain else '.'}get({segment})"
         else:
-            current += f".get('{segment}')"
+            current += f"{'?.' if null_safe_chain else '.'}get('{segment}')"
         guards.append(f"{current} != null")
     return " && ".join(dict.fromkeys(guards)), current
 
 
-def _get_at_path(value: Any, path: List[Union[str, int]]) -> Any:
+def _get_at_path(
+    value: Any, path: List[Union[str, int, ArrayFilterSegment]]
+) -> Any:
     current = value
     for segment in path:
-        if isinstance(segment, int):
+        if isinstance(segment, ArrayFilterSegment):
+            if not isinstance(current, list):
+                return None
+            matching_item = None
+            for item in current:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item.get(segment.field)
+                if candidate is None:
+                    continue
+                candidate_text = str(candidate)
+                if segment.operator == "equals ignore case":
+                    matched = candidate_text.lower() == segment.comparison.lower()
+                else:
+                    matched = candidate_text == segment.comparison
+                if matched:
+                    matching_item = item
+                    break
+            current = matching_item
+        elif isinstance(segment, int):
             if not isinstance(current, list) or segment >= len(current):
                 return None
         elif not isinstance(current, dict) or segment not in current:
