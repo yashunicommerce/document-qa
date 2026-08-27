@@ -597,6 +597,100 @@ def render_examples_tab() -> None:
             st.code(expression, language="json")
 
 
+def render_existing_customisation_test_tab() -> None:
+    st.subheader("Test existing customisation")
+    st.caption(
+        "Paste an existing custom-field or create-order console mapping and test it "
+        "against a Shopify order JSON."
+    )
+
+    customisation_type = st.radio(
+        "What are you testing?",
+        options=[
+            ("Custom field mapping", False),
+            ("Create order customisation", True),
+        ],
+        format_func=lambda option: option[0],
+        horizontal=True,
+        key="existing_test_customisation_type",
+    )
+    customisation_console = customisation_type[1]
+
+    order_col, customisation_col = st.columns(2)
+    with order_col:
+        order_text = st.text_area(
+            "Shopify order JSON",
+            height=360,
+            placeholder='Paste raw Shopify order JSON, e.g. {"id": 123, "tags": "PREPAID"}',
+            key="existing_test_order_json",
+        )
+    with customisation_col:
+        customisation_text = st.text_area(
+            "Existing customisation JSON",
+            height=360,
+            placeholder=(
+                '[{"FieldName":"#{expression}"}]'
+                if not customisation_console
+                else '{"SALEORDER.CODE":"#{expression}"}'
+            ),
+            key="existing_test_customisation_json",
+        )
+
+    if st.button("Test existing customisation", type="primary", key="existing_test_run"):
+        if not order_text.strip():
+            st.error("Paste Shopify order JSON before testing.")
+            return
+        if not customisation_text.strip():
+            st.error("Paste the existing customisation JSON before testing.")
+            return
+
+        try:
+            shopify_order = json.loads(order_text)
+            customisation = parse_customisation(customisation_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            st.error(f"Invalid JSON: {exc}")
+            return
+
+        if not isinstance(shopify_order, dict):
+            st.error("Shopify order JSON must be a JSON object.")
+            return
+        if customisation_console:
+            if not isinstance(customisation, dict):
+                st.error("Create order customisation must be a JSON object.")
+                return
+            invalid_keys = [
+                key for key in customisation if not str(key).startswith("SALEORDER.")
+            ]
+            if invalid_keys:
+                st.error(
+                    "Create order customisation keys must start with SALEORDER.: "
+                    + ", ".join(map(str, invalid_keys))
+                )
+                return
+        elif not isinstance(customisation, list):
+            st.error("Custom-field customisation must be a JSON array of objects.")
+            return
+
+        api_url = get_secret("ORDER_JSON_TEST_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        with st.spinner("Calling order-json-test…"):
+            body, error = call_order_json_test(
+                api_url=api_url,
+                tenant_code=ORDER_TEST_TENANT_CODE,
+                channel_code=ORDER_TEST_CHANNEL_CODE,
+                shopify_order=shopify_order,
+                customisation_expression=customisation,
+                customisation_console=customisation_console,
+            )
+
+        st.subheader("Results")
+        if error and body is None:
+            st.error(error)
+        elif body is not None:
+            if error:
+                st.warning(error)
+            render_results(body)
+
+
 def render_builder_tab(
     channels: List[Dict[str, Any]],
     api_url: str,
@@ -846,7 +940,13 @@ st.caption(
     "Build a custom-field or create-order expression directly from a Shopify order JSON."
 )
 
-render_requirement_tab()
+build_tab, existing_test_tab = st.tabs(
+    ["Build customisation", "Test existing customisation"]
+)
+with build_tab:
+    render_requirement_tab()
+with existing_test_tab:
+    render_existing_customisation_test_tab()
 
 with st.expander("See JSON mapping examples"):
     render_examples_tab()
