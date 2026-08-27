@@ -39,6 +39,8 @@ from order_hints import analyze_order, build_customisation, format_customisation
 DEFAULT_API_URL = (
     "https://shopifyproxy.unicommerce.com/shopify/orders/order-json-test"
 )
+ORDER_TEST_TENANT_CODE = "hoadstaging"
+ORDER_TEST_CHANNEL_CODE = "SHOPIFY"
 
 SAMPLE_ORDER = {
     "id": 7240645378278,
@@ -118,6 +120,27 @@ def render_results(body: Dict[str, Any]) -> None:
         st.json(body)
 
 
+def _server_result_for_field(
+    body: Dict[str, Any], target_field: str
+) -> Optional[Dict[str, Any]]:
+    results = ((body.get("data") or {}).get("expressionResults") or [])
+    if not results:
+        return None
+    return next(
+        (item for item in results if item.get("fieldName") == target_field),
+        results[0],
+    )
+
+
+def _values_match(local_value: Any, server_value: Any) -> bool:
+    if local_value == server_value:
+        return True
+    try:
+        return float(local_value) == float(server_value)
+    except (TypeError, ValueError):
+        return str(local_value) == str(server_value)
+
+
 def render_reference_tab() -> None:
     patterns, meta = load_local_patterns()
     if not patterns:
@@ -192,6 +215,7 @@ def render_requirement_tab(
                     raise ValueError("Order JSON must be one JSON object.")
                 st.session_state.simple_loaded_order = parsed_order
                 st.session_state.pop("simple_result", None)
+                st.session_state.pop("simple_server_result", None)
             except (json.JSONDecodeError, ValueError) as exc:
                 st.error(f"Invalid order JSON: {exc}")
 
@@ -500,6 +524,7 @@ def render_requirement_tab(
                 "finalValue": local_value,
                 "plainEnglish": plain_english,
             }
+            st.session_state.pop("simple_server_result", None)
 
     result = st.session_state.get("simple_result")
     if result:
@@ -512,6 +537,45 @@ def render_requirement_tab(
             "Save the selected value directly; use the custom default if it is missing or null.",
         )
         st.caption(f"In simple English: {plain_english}")
+
+        st.markdown("### Server validation")
+        st.caption(
+            "Send this prepared customisation to `order-json-test` and compare "
+            "the server value with the local preview."
+        )
+        if st.button("Validate with order-json-test", key="simple_server_validate"):
+            api_url = get_secret("ORDER_JSON_TEST_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+            with st.spinner("Calling order-json-test…"):
+                body, error = call_order_json_test(
+                    api_url=api_url,
+                    tenant_code=ORDER_TEST_TENANT_CODE,
+                    channel_code=ORDER_TEST_CHANNEL_CODE,
+                    shopify_order=shopify_order,
+                    customisation_expression=result["customisation"],
+                    customisation_console=customisation_console,
+                )
+            st.session_state.simple_server_result = {"body": body, "error": error}
+
+        server_result = st.session_state.get("simple_server_result")
+        if server_result:
+            body = server_result.get("body")
+            error = server_result.get("error")
+            if error and body is None:
+                st.error(error)
+            elif body is not None:
+                if error:
+                    st.warning(error)
+                render_results(body)
+                evaluated = _server_result_for_field(body, target_field)
+                if evaluated is not None:
+                    server_value = evaluated.get("value", "")
+                    st.code(f"Server value for this order: {server_value}", language=None)
+                    if _values_match(result["finalValue"], server_value):
+                        st.success("Server value matches the local preview.")
+                    else:
+                        st.warning(
+                            "Server value differs from the local preview. Review the server expression result above."
+                        )
 
 
 def render_examples_tab() -> None:
