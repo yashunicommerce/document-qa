@@ -10,9 +10,29 @@ from data_loader import (
     channel_label,
     get_secret,
     load_local_patterns,
+    merge_patterns,
     parse_customisation,
+    patterns_from_channels,
     resolve_channels,
     search_patterns,
+)
+from expression_generator import (
+    ORDER_CUSTOMIZATION_KEYS,
+    TYPE_OVERRIDE_OPTIONS,
+    allowed_order_create_fields,
+    build_generated_customisation,
+    decimal_expression_for_path,
+    default_value_for_type,
+    direct_expression_for_path,
+    json_condition_options,
+    json_field_options,
+    local_ternary_result,
+    local_value_for_type,
+    normalize_selected_type,
+    operators_for_type,
+    plain_language_ternary,
+    suggested_selected_type,
+    ternary_expression,
 )
 from order_hints import analyze_order, build_customisation, format_customisation_json
 
@@ -149,6 +169,368 @@ def render_reference_tab() -> None:
 
     if len(filtered) > 50:
         st.info(f"Showing first 50 of {len(filtered)} matches. Narrow your search to see more.")
+
+
+def render_requirement_tab(
+) -> None:
+    st.subheader("Customisation builder")
+    st.caption("Load an order once, choose the mapping, then generate the final expression.")
+
+    with st.container(border=True):
+        with st.form("load_order_form"):
+            order_text = st.text_area(
+                "1. Paste Shopify order JSON",
+                height=220,
+                placeholder='For example: {"id": 123, "tags": "PREPAID"}',
+                key="simple_order_json",
+            )
+            load_order = st.form_submit_button("Load JSON fields", type="primary")
+        if load_order:
+            try:
+                parsed_order = json.loads(order_text)
+                if not isinstance(parsed_order, dict):
+                    raise ValueError("Order JSON must be one JSON object.")
+                st.session_state.simple_loaded_order = parsed_order
+                st.session_state.pop("simple_result", None)
+            except (json.JSONDecodeError, ValueError) as exc:
+                st.error(f"Invalid order JSON: {exc}")
+
+    shopify_order = st.session_state.get("simple_loaded_order")
+    if not shopify_order:
+        st.info("Paste an order JSON and click **Load JSON fields** to continue.")
+        return
+
+    options = json_field_options(shopify_order)
+    # Direct mappings use scalar fields, while JSON values are useful as the
+    # source of null/not-null rules even when the selected node is an object or
+    # array. Keep those nodes available without changing the direct scalar list.
+    scalar_paths = {tuple(option["path"]) for option in options}
+    for condition_option in json_condition_options(shopify_order):
+        if isinstance(condition_option["value"], (dict, list)) and tuple(condition_option["path"]) not in scalar_paths:
+            options.append(condition_option)
+    if not options:
+        st.error("No simple values were found in the JSON.")
+        return
+    option_map = {option["label"]: option for option in options}
+    option_labels = list(option_map.keys())
+    condition_option_map = {option["label"]: option for option in json_condition_options(shopify_order)}
+    condition_option_labels = list(condition_option_map.keys())
+    if "simple_condition_count" not in st.session_state:
+        st.session_state.simple_condition_count = 1
+
+    with st.container(border=True):
+        st.markdown("### 2. Choose mapping")
+        customisation_console = st.radio(
+            "Create",
+            options=["Custom field", "Create order customisation"],
+            horizontal=True,
+        ) == "Create order customisation"
+        if customisation_console:
+            target_field = st.selectbox(
+                "Create-order customisation key",
+                ORDER_CUSTOMIZATION_KEYS,
+                help="Only keys supported by OrderCustomizationKeys can be used here.",
+            )
+        else:
+            target_field = st.text_input(
+                "Destination custom-field name",
+                placeholder="For example: BAC",
+            ).strip()
+        # These controls intentionally live outside the form. Streamlit forms
+        # batch widget changes; keeping the dependent selectors outside makes
+        # Action refresh immediately when the source or semantic type changes.
+        source_label = st.selectbox("Shopify value to use", option_labels)
+        source = option_map[source_label]
+        inferred_type = suggested_selected_type(source["value"])
+        selected_type = st.selectbox(
+            "Treat selected value as",
+            TYPE_OVERRIDE_OPTIONS,
+            index=TYPE_OVERRIDE_OPTIONS.index(inferred_type),
+            help="Override the JSON storage type when the value is semantically different, such as a numeric string.",
+        )
+        selected_type = normalize_selected_type(selected_type)
+
+        action_options = {
+            "String": [
+                "Save directly",
+                "Contains (ternary)",
+                "Equals (ternary)",
+                "Equals ignore case (ternary)",
+                "Use conditions (ternary)",
+            ],
+            "Decimal": ["Save directly", "Use conditions (ternary)", "Add/subtract"],
+            "DateTime": ["Save directly"],
+            "Boolean": ["Save directly", "Use conditions (equals true/false)"],
+            "JSON": ["Use null/not-null conditions"],
+        }[selected_type]
+        action = st.selectbox(
+            "Action",
+            action_options,
+            help="Available actions change with the selected semantic type.",
+        )
+        custom_default_value = st.text_input(
+            "Custom default value (if source is missing/null or no condition matches)",
+            value="",
+            placeholder="Blank uses the type default",
+            help="Used by direct, transform, and ternary expressions. Blank means '', 0.0, false, or the type's empty value.",
+        )
+        if selected_type == "DateTime":
+            st.info("DateTime formatting and comparison actions can be added to this action area later. Direct save is available now.")
+
+        # These dependent transform controls also stay outside the form so
+        # changing the operand mode immediately swaps the amount input for the
+        # secondary JSON-field selector.
+        transform_operation = "Add"
+        operand_mode = "Hardcoded decimal amount"
+        adjustment_amount = "0"
+        secondary_source_label = None
+        if action == "Add/subtract":
+            tcol1, tcol2 = st.columns(2)
+            with tcol1:
+                transform_operation = st.selectbox("Transform", ["Add", "Subtract"])
+            with tcol2:
+                operand_mode = st.radio(
+                    "Add/subtract by",
+                    ["Hardcoded decimal amount", "Another selected JSON field"],
+                )
+            if operand_mode == "Hardcoded decimal amount":
+                adjustment_amount = st.text_input("Decimal amount", value="0")
+            else:
+                secondary_source_label = st.selectbox(
+                    "Decimal field to add/subtract",
+                    option_labels,
+                    help="The secondary field is converted with getAsDouble(); if it is missing at runtime, zero is used.",
+                )
+
+        with st.form("customisation_builder_form"):
+
+            forced_condition_operator = {
+                "Contains (ternary)": "contains",
+                "Equals (ternary)": "equals",
+                "Equals ignore case (ternary)": "equals ignore case",
+            }.get(action)
+            condition_action = action in {
+                "Contains (ternary)",
+                "Equals (ternary)",
+                "Equals ignore case (ternary)",
+                "Use conditions (ternary)",
+                "Use conditions (equals true/false)",
+                "Use null/not-null conditions",
+            }
+            if condition_action:
+                st.markdown("### 3. Ternary rule")
+                st.caption("When enabled, the first matching condition wins.")
+            condition_inputs = []
+            condition_source_default = next(
+                (
+                    label
+                    for label, option in condition_option_map.items()
+                    if option["path"] == source["path"]
+                ),
+                condition_option_labels[0],
+            )
+            for index in range(st.session_state.simple_condition_count if condition_action else 0):
+                label = f"Condition {index + 1}"
+                with st.expander(label, expanded=True):
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        available_condition_labels = (
+                            [condition_source_default]
+                            if selected_type == "JSON"
+                            else condition_option_labels
+                        )
+                        condition_source = st.selectbox(
+                            "JSON value",
+                            available_condition_labels,
+                            index=0,
+                            key=f"simple_condition_source_{index}",
+                        )
+                    selected_value = condition_option_map[condition_source]["value"]
+                    condition_type = (
+                        selected_type
+                        if condition_option_map[condition_source]["path"] == source["path"]
+                        else suggested_selected_type(selected_value)
+                    )
+                    condition_operators = operators_for_type(condition_type)
+                    if forced_condition_operator:
+                        condition_operators = [forced_condition_operator]
+                    with c2:
+                        operator = st.selectbox(
+                            f"Check ({condition_type})",
+                            condition_operators,
+                            key=f"simple_condition_operator_{index}",
+                        )
+                    with c3:
+                        if condition_type == "Boolean":
+                            comparison = st.selectbox(
+                                "Compare with",
+                                ["true", "false"],
+                                key=f"simple_condition_comparison_{index}",
+                            )
+                        elif operator in {"is null", "is not null"}:
+                            comparison = ""
+                            st.caption("No comparison value")
+                        else:
+                            comparison = st.text_input(
+                                "Compare with",
+                                key=f"simple_condition_comparison_{index}",
+                            )
+                    with c4:
+                        true_value = st.text_input("If true, pass", key=f"simple_condition_true_{index}")
+                    condition_inputs.append(
+                        {
+                            "sourceLabel": condition_source,
+                            "path": condition_option_map[condition_source]["path"],
+                            "operator": operator,
+                            "comparison": comparison,
+                            "trueValue": true_value,
+                            "selectedType": condition_type,
+                            "sampleValue": selected_value,
+                            "order": shopify_order,
+                        }
+                    )
+            default_value = (
+                custom_default_value
+                if condition_action
+                else ""
+            )
+            add_condition = (
+                st.form_submit_button("Add another condition") if condition_action else False
+            )
+            generate = st.form_submit_button("Generate customisation", type="primary")
+
+        if add_condition:
+            st.session_state.simple_condition_count = min(st.session_state.simple_condition_count + 1, 6)
+            st.rerun()
+        if generate:
+            if not target_field:
+                st.error("Enter a destination custom-field name or a console key.")
+                return
+            if customisation_console and not target_field.startswith("SALEORDER."):
+                st.error("A create-order customisation must use a SALEORDER.* key.")
+                return
+            try:
+                effective_default = default_value_for_type(
+                    custom_default_value, selected_type
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            plain_english = f"Save the selected value directly; if it is missing or null, save {effective_default!r}."
+            if action == "Save directly":
+                expression = direct_expression_for_path(
+                    source["path"], selected_type, effective_default
+                )
+                try:
+                    local_value = (
+                        effective_default
+                        if source["value"] is None
+                        else local_value_for_type(source["value"], selected_type)
+                    )
+                except (TypeError, ValueError):
+                    st.error("The selected value cannot be converted to the chosen type.")
+                    return
+            elif action == "Add/subtract":
+                secondary_path = None
+                if operand_mode == "Hardcoded decimal amount":
+                    try:
+                        amount = float(adjustment_amount)
+                    except ValueError:
+                        st.error("Decimal amount must be a number.")
+                        return
+                else:
+                    secondary_path = option_map[secondary_source_label]["path"]
+                    secondary_value = option_map[secondary_source_label]["value"]
+                    try:
+                        amount = float(secondary_value) if secondary_value is not None else 0.0
+                    except (TypeError, ValueError):
+                        st.error("The secondary JSON field must contain a numeric value or be null.")
+                        return
+                if source["value"] is None:
+                    source_amount = None
+                else:
+                    try:
+                        source_amount = float(source["value"])
+                    except (TypeError, ValueError):
+                        st.error("The selected value cannot be converted to decimal.")
+                        return
+                operation = transform_operation.lower()
+                expression = decimal_expression_for_path(
+                    source["path"],
+                    operation,
+                    adjustment_amount,
+                    secondary_path=secondary_path,
+                    default_value=effective_default,
+                )
+                local_value = effective_default if source_amount is None else (
+                    source_amount + amount if operation == "add" else source_amount - amount
+                )
+                plain_english = (
+                    "Save the selected decimal value after the requested transformation; "
+                    f"if it is missing or null, save {effective_default!r}."
+                )
+            else:
+                conditions = [
+                    condition
+                    for condition in condition_inputs
+                    if condition["operator"] in {"is null", "is not null"}
+                    or str(condition["comparison"]).strip()
+                ]
+                if not conditions:
+                    st.error("Add a comparison value for at least one ternary condition.")
+                    return
+                for condition in conditions:
+                    if condition["selectedType"] == "Decimal" and condition["operator"] not in {
+                        "is null",
+                        "is not null",
+                    }:
+                        try:
+                            float(condition["comparison"])
+                        except (TypeError, ValueError):
+                            st.error("Decimal comparisons must use a numeric value.")
+                            return
+                expression = ternary_expression(
+                    conditions, effective_default, result_type=selected_type
+                )
+                local_value = local_ternary_result(conditions, effective_default)
+                plain_english = plain_language_ternary(conditions, effective_default)
+            st.session_state.simple_result = {
+                "customisation": build_generated_customisation(target_field, expression, customisation_console),
+                "sourceValue": source["value"],
+                "finalValue": local_value,
+                "plainEnglish": plain_english,
+            }
+
+    result = st.session_state.get("simple_result")
+    if result:
+        st.markdown("### Final customisation")
+        st.code(format_customisation_json(result["customisation"]), language="json")
+        st.success(f"Local validation passed. Source value: `{result['sourceValue']}`")
+        st.code(f"Final value for this order: {result['finalValue']}", language=None)
+        plain_english = result.get(
+            "plainEnglish",
+            "Save the selected value directly; use the custom default if it is missing or null.",
+        )
+        st.caption(f"In simple English: {plain_english}")
+
+
+def render_examples_tab() -> None:
+    st.subheader("How to map Shopify JSON")
+    st.caption("Examples cover the common shapes TAM uses: simple values, nested objects, and arrays.")
+    examples = [
+        ("Simple field: tags", '{"id":"lll", "tags":"keys,jj"}', "pass tags to custom field Tags", '[{"Tags":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson, \'tags\')}"}]'),
+        ("Nested object: city", '{"shipping_address":{"city":"Delhi"}}', "pass shipping address city to custom field City", '[{"City":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson.get(\'shipping_address\'), \'city\')}"}]'),
+        ("First array item: vendor", '{"line_items":[{"vendor":"FPPR"}]}', "pass vendor to custom field BAC", '[{"BAC":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson.get(\'line_items\').get(0), \'vendor\')}"}]'),
+        ("First array item: shipping code", '{"shipping_lines":[{"code":"EXPRESS"}]}', "pass shipping code to custom field Shipping_Code", '[{"Shipping_Code":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson.get(\'shipping_lines\').get(0), \'code\')}"}]'),
+        ("Two nested objects: currency", '{"line_items":[{"price_set":{"shop_money":{"currency_code":"INR"}}}]}', "pass currency code to custom field Currency", '[{"Currency":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson.get(\'line_items\').get(0).get(\'price_set\').get(\'shop_money\'), \'currency_code\')}"}]'),
+        ("Nested arrays: property value", '{"line_items":[{"properties":[{"name":"Size","value":"XL"}]}]}', "pass value to custom field Size", '[{"Size":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson.get(\'line_items\').get(0).get(\'properties\').get(0), \'value\')}"}]'),
+        ("Sale-order-create: order code", '{"id":"6846821728327"}', "pass id to SALEORDER.CODE", '{"SALEORDER.CODE":"#{T(com.unifier.core.utils.JsonUtils).getAsString(#saleOrderJson, \'id\')}"}'),
+    ]
+    for title, sample_json, requirement, expression in examples:
+        with st.expander(title):
+            st.caption(f"Requirement: {requirement}")
+            st.code(sample_json, language="json")
+            st.code(expression, language="json")
 
 
 def render_builder_tab(
@@ -397,62 +779,10 @@ st.set_page_config(
 
 st.title("Shopify Order Customisation Tester")
 st.caption(
-    "Dry-run channel customisations against sample Shopify order JSON via `order-json-test`. "
-    "No OpenAI key required."
+    "Build a custom-field or create-order expression directly from a Shopify order JSON."
 )
 
-mongo_uri = get_secret("MONGO_URI")
-mongo_db = get_secret("MONGO_DB", "shopify") or "shopify"
-api_url = get_secret("ORDER_JSON_TEST_URL", DEFAULT_API_URL) or DEFAULT_API_URL
-prefer_local = get_secret("USE_LOCAL_INDEX", "false").lower() in {"1", "true", "yes"}
+render_requirement_tab()
 
-with st.sidebar:
-    st.header("Configuration")
-    st.text_input("API URL", value=api_url, disabled=True)
-
-    source_options = ["Local snapshot", "MongoDB live"]
-    default_source = "Local snapshot" if prefer_local or not mongo_uri else "MongoDB live"
-    data_source = st.radio("Channel source", source_options, index=source_options.index(default_source))
-
-    try:
-        channels, source_label, source_meta = resolve_channels(data_source, mongo_uri, mongo_db)
-    except Exception as exc:
-        st.error(f"Could not load channels: {exc}")
-        st.stop()
-
-    st.success(f"Using {source_label}")
-    if source_meta.get("mongoError"):
-        st.warning(f"Mongo fallback: {source_meta['mongoError']}")
-    st.metric("Channels loaded", len(channels))
-
-    patterns, pattern_meta = load_local_patterns()
-    if patterns:
-        st.metric("Reference expressions", pattern_meta.get("patternCount", len(patterns)))
-
-    with st.expander("Source info"):
-        st.markdown(
-            "- `data/channels_index.json` — 490 production channels (Aug 2026)\n"
-            "- `data/expression_patterns.json` — 312 unique SpEL expressions\n"
-            "- See `data/source_info.md` for categories"
-        )
-        if source_meta.get("source"):
-            st.caption(source_meta["source"])
-        if source_meta.get("extractedAt"):
-            st.caption(f"Snapshot date: {source_meta['extractedAt']}")
-
-if not channels:
-    st.error("No channels available. Configure Mongo or ship `data/channels_index.json`.")
-    st.stop()
-
-builder_tab, test_tab, reference_tab = st.tabs(
-    ["Build customisation", "Run test (existing channel)", "Expression reference"]
-)
-
-with builder_tab:
-    render_builder_tab(channels, api_url)
-
-with test_tab:
-    render_test_tab(channels, api_url)
-
-with reference_tab:
-    render_reference_tab()
+with st.expander("See JSON mapping examples"):
+    render_examples_tab()
