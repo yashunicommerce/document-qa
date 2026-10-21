@@ -421,6 +421,12 @@ def render_requirement_tab(
             placeholder="Blank uses the type default",
             help="Used by direct, transform, and ternary expressions. Blank means '', 0.0, false, or the type's empty value.",
         )
+        blank_as_missing = False
+        if action == "Save directly" and selected_type in {"String", "Decimal"}:
+            blank_as_missing = st.checkbox(
+                "Use default for blank or whitespace-only values",
+                help="Return the custom default when the selected value is empty or contains only whitespace.",
+            )
         if selected_type == "DateTime":
             st.info("DateTime formatting and comparison actions can be added to this action area later. Direct save is available now.")
 
@@ -570,13 +576,15 @@ def render_requirement_tab(
                 return
             plain_english = f"Save the selected value directly; if it is missing or null, save {effective_default!r}."
             if action == "Save directly":
+                if blank_as_missing:
+                    plain_english = f"Save the selected value; if missing, null, blank or whitespace-only, save {effective_default!r}."
                 expression = direct_expression_for_path(
-                    source["path"], selected_type, effective_default
+                    source["path"], selected_type, effective_default, blank_as_missing=blank_as_missing
                 )
                 try:
                     local_value = (
                         effective_default
-                        if source["value"] is None
+                        if source["value"] is None or (blank_as_missing and not str(source["value"]).strip())
                         else local_value_for_type(source["value"], selected_type)
                     )
                 except (TypeError, ValueError):
