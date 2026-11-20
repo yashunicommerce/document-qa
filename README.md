@@ -1,17 +1,22 @@
 # Shopify Order Customisation Tester
 
-Streamlit UI for the TA team to dry-run Shopify channel customisations via `POST /shopify/orders/order-json-test` — no OpenAI key required.
+Streamlit UI for the TAM team to dry-run Shopify channel customisations via `POST /shopify/orders/order-json-test`.
 
 **Linear:** [PI-8569](https://linear.app/unicommerce/issue/PI-8569/shopify-add-order-json-test-customization-dry-run-api-to-production)
 
 ## Features
 
-- **Build customisation** tab — paste order JSON, pick custom fields or order-create console, tick suggested mappings, generate JSON, and test
-- Tenant + channel dropdown from **MongoDB live** or **local snapshot** (`data/channels_index.json`)
-- Auto-loads `customFieldsCustomization` or `orderCreateCustomization` for the selected channel
-- Paste Shopify order JSON and run expression evaluation via `order-json-test`
-- **Expression reference** tab — 312 production SpEL patterns with example channels
-- Shows per-field status, value (including empty string), and errors
+Single page. Building a customisation is done with Rovo from the
+[Shopify Customisation runbook](https://unicommerce.atlassian.net/wiki/spaces/PE/pages/4341694468/Shopify+Customisation);
+this app only tests it.
+
+- Paste a Shopify order JSON and a customisation, click **Test customisation**
+- Auto-detects the type: JSON array → `customFieldsCustomization`, object with `SALEORDER.*` keys → `orderCreateCustomization`
+- Clear verdict (working / not working) plus the output of every field for that order
+- Item-level expressions (`#saleOrderItem`, `#saleOrderItemJson`) are run once per line item, because `order-json-test` rejects expressions that do not read `#saleOrderJson`
+- Constant values (no `#{…}`) are shown as-is instead of being sent to the API
+- "Review before saving" list: duplicate or space-padded field names, unsupported `SALEORDER.*` keys, smart quotes, `saleOrderJson` without `#`
+- Accepts the `{"order": {...}}` wrapper from the Shopify REST API
 
 ## Setup
 
