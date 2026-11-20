@@ -172,7 +172,7 @@ def suggest_from_order_json(
     """Create one safe direct-field mapping when no production example matches.
 
     This intentionally supports only a scalar field named in the requirement.
-    Array paths always use the first item, which is made visible in the draft and
+    Array paths use a concrete index, which is made visible in the draft and
     still must pass the server-side order-json-test validation.
     """
     request_tokens = _tokens(requirement)
@@ -276,6 +276,7 @@ def direct_expression_for_path(
     path: List[Union[str, int, ArrayFilterSegment]],
     selected_type: str = "String",
     default_value: str = "",
+    blank_as_missing: bool = False,
 ) -> str:
     """Build a null-safe direct expression for the selected semantic type."""
     guard, _ = _path_guard_and_raw(path)
@@ -288,11 +289,15 @@ def direct_expression_for_path(
         value_expression = f"{raw_source}.getAsDouble()"
     elif normalized_type == "Boolean":
         value_expression = f"{raw_source}.getAsBoolean()"
-    elif any(isinstance(segment, ArrayFilterSegment) for segment in path):
+    elif isinstance(path[-1], int) or any(isinstance(segment, ArrayFilterSegment) for segment in path):
         value_expression = f"{raw_source}?.getAsString()"
     else:
         # String and DateTime are both represented as text in the TAM expression.
         value_expression = _json_utils_expression(path[:-1], str(path[-1]))[2:-1]
+    if blank_as_missing:
+        guard += (
+            f" && T(com.unifier.core.utils.StringUtils).isNotBlank({raw_source}.getAsString())"
+        )
     return f"#{{{guard} ? {value_expression} : {_typed_spel_literal(default_value, normalized_type)}}}"
 
 
@@ -535,8 +540,11 @@ def _walk_scalar_paths(
             else:
                 matches.extend(_walk_scalar_paths(child, child_path))
     elif isinstance(value, list):
-        for index, child in enumerate(value[:1]):
-            matches.extend(_walk_scalar_paths(child, path + [index]))
+        for index, child in enumerate(value):
+            if isinstance(child, (dict, list)):
+                matches.extend(_walk_scalar_paths(child, path + [index]))
+            else:
+                matches.append((path + [index], str(index)))
     return matches
 
 
@@ -551,7 +559,7 @@ def _walk_node_paths(
             nodes.append((child_path, child))
             nodes.extend(_walk_node_paths(child, child_path))
     elif isinstance(value, list):
-        for index, child in enumerate(value[:1]):
+        for index, child in enumerate(value):
             child_path = path + [index]
             nodes.append((child_path, child))
             nodes.extend(_walk_node_paths(child, child_path))
@@ -572,19 +580,20 @@ def _path_guard_and_raw(
     path: List[Union[str, int, ArrayFilterSegment]]
 ) -> Tuple[str, str]:
     current = "#saleOrderJson"
-    guards = [f"{current} != null"]
+    guards = [f"{current} != null", f"!{current}.isJsonNull()"]
     null_safe_chain = False
     for segment in path:
         if isinstance(segment, ArrayFilterSegment):
-            guards.append(f"{current} != null")
+            guards.append(f"{current}.isJsonArray()")
             comparison = _spel_string(segment.comparison)
-            if segment.operator == "equals ignore case":
-                predicate = (
-                    f"get('{segment.field}')?.getAsString().equalsIgnoreCase({comparison})"
-                )
-            else:
-                predicate = f"get('{segment.field}')?.getAsString().equals({comparison})"
-            current += f".^[{predicate}]"
+            field = _spel_string(segment.field)
+            method = "equalsIgnoreCase" if segment.operator == "equals ignore case" else "equals"
+            predicate = (
+                f"isJsonObject() && get({field}) != null && "
+                f"get({field}).isJsonPrimitive() && "
+                f"get({field}).getAsString().{method}({comparison})"
+            )
+            current += f".getAsJsonArray().^[{predicate}]"
             null_safe_chain = True
         elif isinstance(segment, int):
             guards.append(f"{current} != null")
@@ -593,6 +602,7 @@ def _path_guard_and_raw(
         else:
             current += f"{'?.' if null_safe_chain else '.'}get('{segment}')"
         guards.append(f"{current} != null")
+        guards.append(f"!{current}.isJsonNull()")
     return " && ".join(dict.fromkeys(guards)), current
 
 
@@ -620,6 +630,7 @@ def _get_at_path(
                     matching_item = item
                     break
             current = matching_item
+            continue
         elif isinstance(segment, int):
             if not isinstance(current, list) or segment >= len(current):
                 return None
